@@ -96,8 +96,9 @@ class Attention(nn.Module):
                 self.norm = nn.LayerNorm(dim)
                 self.act = nn.GELU()
 
-                self.q = nn.Linear(dim, dim, bias=qkv_bias)
-                self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+                self.w1 = nn.Linear(dim, dim, bias=qkv_bias)
+                self.w2 = nn.Linear(dim, dim, bias=qkv_bias)
+                self.wi = nn.Conv2d(dim, dim, 1, bias=qkv_bias)
         else:
             self.q = nn.Linear(dim, dim, bias=qkv_bias)
             self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
@@ -131,26 +132,27 @@ class Attention(nn.Module):
             self.lepe_linear(x).transpose(1, 2).view(B, C, H, W)).view(B, C, -1).transpose(-1, -2)
         if self.sr_ratio > 1:
             if mask is None:
-                q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+                wv1 = self.w1(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
                 x_ = x.permute(0, 2, 1).reshape(B, C, H, W)
                 x_1 = self.sr(x_).reshape(B, C, -1).permute(0, 2, 1)
                 x_1 = self.act(self.norm(x_1))
-                kv = self.kv(x_1).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+                wv2 = self.w2(x_1).reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+                I = self.wi(x_1.permute(0, 2, 1).reshape(B, C, H // self.sr_ratio, W // self.sr_ratio)).reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
 
-                k, v = kv[0], kv[1]
-
-                attn = (q @ k.transpose(-2, -1)) * self.scale
-                attn = attn.softmax(dim=-1)
-                attn = self.attn_drop(attn)
-                x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+                a = (wv1 @ wv2.transpose(-2, -1)) * self.scale
+                A = a.softmax(dim=-1)
+                A = self.attn_drop(A)
+                mask_a = torch.mean(A.detach().mean(1), dim=1)  # B Nk  #max ?  mean ?
+                mask_a = F.interpolate(mask_a.view(B, 1, H // self.sr_ratio, W // self.sr_ratio),
+                                                  (H, W), mode='nearest')    # b 1 h w
+                mask_a = mask_a.view(B, 1, H * W).permute(0, 2, 1) # b n 1
+                
+                I1 = (A @ I).transpose(1, 2).reshape(B, N, C)
+                x = I1 * mask_a
                 x = self.proj(x + lepe)
                 x = self.proj_drop(x)
 
-                global_mask_value = torch.mean(attn.detach().mean(1), dim=1)  # B Nk  #max ?  mean ?
-                global_mask_value = F.interpolate(global_mask_value.view(B, 1, H // self.sr_ratio, W // self.sr_ratio),
-                                                  (H, W), mode='nearest')[:, 0]
-
-                mask = global_mask_value
+                mask = x
             else:
                 q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
 
@@ -360,3 +362,4 @@ def SSP_block(embed_dim, sr_ratio, pretrained=False, **kwargs):
     model.default_cfg = _cfg()
 
     return model
+
